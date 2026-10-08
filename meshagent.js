@@ -842,7 +842,52 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                     targetNodeKey + '.'
                 );
 
-                callback();
+                // A pending write may recreate the transient node after the
+                // initial rebind removes it. Reconcile it on a later aliased
+                // connection, but only when the stale record is offline and
+                // its system UUID matches the persisted alias.
+                var staleNodeKey = obj.actualDbNodeKey;
+                db.Get(staleNodeKey, function (staleErr, staleNodes) {
+                    if ((staleErr != null) || (staleNodes == null) || (staleNodes.length != 1)) {
+                        callback();
+                        return;
+                    }
+
+                    var staleState = parent.parent.GetConnectivityState(staleNodeKey);
+                    if (((staleState != null) && ((staleState.connectivity & 1) != 0)) ||
+                        ((parent.wsagents[staleNodeKey] != null) && (parent.wsagents[staleNodeKey] !== obj))) {
+                        parent.parent.debug('agent', 'Hardware identity alias cleanup skipped: transient node is online.');
+                        callback();
+                        return;
+                    }
+
+                    db.Get('si' + staleNodeKey, function (siErr, staleInfos) {
+                        var staleIdentity = ((siErr == null) && (staleInfos != null) && (staleInfos.length == 1)) ? getHardwareIdentity(staleInfos[0]) : null;
+                        if ((staleIdentity == null) || (staleIdentity.uuid != alias.uuid)) {
+                            parent.parent.debug('agent', 'Hardware identity alias cleanup skipped: transient UUID is not verified.');
+                            callback();
+                            return;
+                        }
+
+                        db.Remove(staleNodeKey, function (removeErr) {
+                            if (removeErr != null) {
+                                parent.parent.debug('agent', 'Hardware identity alias cleanup failed to remove transient node.');
+                                callback();
+                                return;
+                            }
+
+                            // Do not remove the hwi alias or any target records.
+                            db.Remove('si' + staleNodeKey);
+                            db.Remove('if' + staleNodeKey);
+                            db.Remove('nt' + staleNodeKey);
+                            db.Remove('lc' + staleNodeKey);
+                            db.Remove('al' + staleNodeKey);
+                            if (db.RemoveSMBIOS) { db.RemoveSMBIOS(staleNodeKey); }
+                            parent.parent.debug('agent', 'Hardware identity alias cleanup removed transient node ' + staleNodeKey + '.');
+                            callback();
+                        });
+                    });
+                });
             });
         });
     }
