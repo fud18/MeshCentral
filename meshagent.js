@@ -869,23 +869,64 @@ module.exports.CreateMeshAgent = function (parent, db, ws, req, args, domain) {
                             return;
                         }
 
-                        db.Remove(staleNodeKey, function (removeErr) {
-                            if (removeErr != null) {
-                                parent.parent.debug('agent', 'Hardware identity alias cleanup failed to remove transient node.');
-                                callback();
-                                return;
-                            }
-
-                            // Do not remove the hwi alias or any target records.
-                            db.Remove('si' + staleNodeKey);
-                            db.Remove('if' + staleNodeKey);
-                            db.Remove('nt' + staleNodeKey);
-                            db.Remove('lc' + staleNodeKey);
-                            db.Remove('al' + staleNodeKey);
-                            if (db.RemoveSMBIOS) { db.RemoveSMBIOS(staleNodeKey); }
-                            parent.parent.debug('agent', 'Hardware identity alias cleanup removed transient node ' + staleNodeKey + '.');
+                        // The NeDB power collection is the only backend for which this
+                        // migration is implemented. Other backends must retain the
+                        // transient record rather than silently discard its history.
+                        if ((db.databaseType !== 1) || (db.powerfile == null) ||
+                            (typeof db.powerfile.update !== 'function')) {
+                            parent.parent.debug('agent', 'Hardware identity alias cleanup deferred: power-history migration is not supported by this database backend.');
                             callback();
-                        });
+                            return;
+                        }
+
+                        // Update power ownership in place, preserving the original
+                        // event IDs, timestamps and other fields. Await the write
+                        // before removing the transient node.
+                        db.powerfile.update({ nodeid: staleNodeKey },
+                            { $set: { nodeid: targetNodeKey } },
+                            { multi: true }, function (powerErr) {
+                                if (powerErr != null) {
+                                    parent.parent.debug('agent', 'Hardware identity alias cleanup deferred: power-history migration failed.');
+                                    callback();
+                                    return;
+                                }
+
+                                // Confirm no records remain under the transient key.
+                                db.powerfile.count({ nodeid: staleNodeKey }, function (countErr, remaining) {
+                                    if ((countErr != null) || (remaining !== 0)) {
+                                        parent.parent.debug('agent', 'Hardware identity alias cleanup deferred: power-history verification failed.');
+                                        callback();
+                                        return;
+                                    }
+
+                                    // Remove metadata one record at a time, waiting for
+                                    // each callback. Keep the alias and all target data.
+                                    var staleKeys = ['si', 'if', 'nt', 'lc', 'al'].map(function (prefix) { return prefix + staleNodeKey; });
+                                    function removeNextStaleRecord() {
+                                        if (staleKeys.length === 0) {
+                                            db.Remove(staleNodeKey, function (removeErr) {
+                                                if (removeErr != null) {
+                                                    parent.parent.debug('agent', 'Hardware identity alias cleanup failed to remove transient node.');
+                                                } else {
+                                                    parent.parent.debug('agent', 'Hardware identity alias cleanup removed transient node ' + staleNodeKey + '.');
+                                                }
+                                                callback();
+                                            });
+                                            return;
+                                        }
+                                        var staleKey = staleKeys.shift();
+                                        db.Remove(staleKey, function (removeErr) {
+                                            if (removeErr != null) {
+                                                parent.parent.debug('agent', 'Hardware identity alias cleanup deferred: failed to remove ' + staleKey + '.');
+                                                callback();
+                                                return;
+                                            }
+                                            removeNextStaleRecord();
+                                        });
+                                    }
+                                    removeNextStaleRecord();
+                                });
+                            });
                     });
                 });
             });
