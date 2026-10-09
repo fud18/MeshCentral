@@ -23,11 +23,23 @@ function runCase(label, opts = {}) {
         if (!opts.missingDuplicate) records.set(duplicate, { _id: duplicate });
         records.set('si' + duplicate, { hardware: { identifiers: { product_uuid: opts.wrongUuid ? '00000000-0000-4000-8000-000000000001' : uuid } } });
         const removed = [];
+        const power = [{ _id: 'p1', nodeid: duplicate, time: 100 }];
         const obj = { nodeid: 'new-cert', dbNodeKey: duplicate, actualDbNodeKey: duplicate };
         const agents = {};
         if (opts.originalOnline) agents[original] = { nodeid: 'other-cert' };
         if (opts.duplicateOnline) agents[duplicate] = { nodeid: 'other-cert' };
         const db = {
+            databaseType: opts.unsupportedBackend ? 8 : 1,
+            powerfile: {
+                update(query, changes, settings, cb) {
+                    queueMicrotask(() => {
+                        if (opts.powerFailure) { cb(new Error('simulated write failure')); return; }
+                        for (const row of power) if (row.nodeid === query.nodeid) row.nodeid = changes.$set.nodeid;
+                        cb(null, 1);
+                    });
+                },
+                count(query, cb) { queueMicrotask(() => cb(null, power.filter(row => row.nodeid === query.nodeid).length)); }
+            },
             Get(key, cb) { queueMicrotask(() => cb(null, records.has(key) ? [records.get(key)] : [])); },
             Remove(key, cb) {
                 removed.push(key);
@@ -61,9 +73,10 @@ function runCase(label, opts = {}) {
                     assert(records.has(duplicate), 'Duplicate must remain when rebind refused');
                 } else {
                     assert.equal(obj.dbNodeKey, original);
-                    if (!opts.duplicateOnline && !opts.wrongUuid && !opts.missingDuplicate) {
+                    if (!opts.duplicateOnline && !opts.wrongUuid && !opts.missingDuplicate && !opts.powerFailure && !opts.unsupportedBackend) {
                         assert(!records.has(duplicate), 'Verified offline duplicate should be removed');
                         assert(records.has('hwi' + duplicate), 'Alias must survive');
+                        assert.equal(power[0].nodeid, original, 'Power ownership must migrate');
                     } else if (!opts.missingDuplicate) {
                         assert(records.has(duplicate), 'Unverified/online duplicate must remain');
                     }
@@ -81,5 +94,7 @@ function runCase(label, opts = {}) {
     await runCase('UUID mismatch prevents deletion', { wrongUuid: true });
     await runCase('Missing alias does not rebind', { missingAlias: true });
     await runCase('Missing duplicate still resolves alias', { missingDuplicate: true });
+    await runCase('Power migration failure retains duplicate', { powerFailure: true });
+    await runCase('Unsupported database retains duplicate', { unsupportedBackend: true });
     console.log('All hardware identity alias regression tests passed.');
 })().catch(err => { console.error('[FAIL]', err); process.exitCode = 1; });
